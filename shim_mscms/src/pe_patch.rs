@@ -15,6 +15,7 @@ struct Section {
     virtual_addr: usize,
     raw_size: usize,
     raw_addr: usize,
+    characteristics: u32,
 }
 
 struct PeImage<'a> {
@@ -82,6 +83,7 @@ impl<'a> PeImage<'a> {
                 virtual_addr: read_u32(bytes, o + 12).unwrap_or(0) as usize,
                 raw_size: read_u32(bytes, o + 16).unwrap_or(0) as usize,
                 raw_addr: read_u32(bytes, o + 20).unwrap_or(0) as usize,
+                characteristics: read_u32(bytes, o + 36).unwrap_or(0),
             });
         }
         Ok(Self {
@@ -165,9 +167,14 @@ fn match_masked(haystack: &[u8], pattern: &[Option<u8>]) -> Option<usize> {
 }
 
 fn find_translate_tracker_vftables(pe: &PeImage<'_>) -> Vec<usize> {
+    const IMAGE_SCN_MEM_DISCARDABLE: u32 = 0x0200_0000;
+    const IMAGE_SCN_MEM_READ: u32 = 0x4000_0000;
     let mut td_rvas = Vec::new();
     for sec in &pe.sections {
-        if sec.name.starts_with(b".text") {
+        if sec.name.starts_with(b".text")
+            || (sec.characteristics & IMAGE_SCN_MEM_DISCARDABLE) != 0
+            || (sec.characteristics & IMAGE_SCN_MEM_READ) == 0
+        {
             continue;
         }
         let Some(slice) = pe.section_slice(*sec) else {
