@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import sys
 from pathlib import Path
 
 from translator_proxy.config import load_config
@@ -14,10 +15,14 @@ def main() -> None:
     parser.add_argument("--log-file", type=Path, default=None, help="Optional log file path")
     args = parser.parse_args()
 
-    handlers: list[logging.Handler] = [logging.StreamHandler()]
+    handlers: list[logging.Handler] = []
+    if sys.stderr is not None:
+        handlers.append(logging.StreamHandler())
     if args.log_file is not None:
         args.log_file.parent.mkdir(parents=True, exist_ok=True)
         handlers.append(logging.FileHandler(args.log_file, encoding="utf-8"))
+    if not handlers:
+        handlers.append(logging.NullHandler())
 
     logging.basicConfig(
         level=logging.INFO,

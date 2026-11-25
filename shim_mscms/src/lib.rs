@@ -1,6 +1,8 @@
 #![allow(non_snake_case)]
 
 pub mod pe_patch;
+#[cfg(target_os = "windows")]
+pub mod remote_patch;
 
 #[cfg(target_os = "windows")]
 mod shim_runtime {
