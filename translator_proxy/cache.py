@@ -6,6 +6,7 @@ import threading
 import time
 from collections import OrderedDict
 from pathlib import Path
+from typing import Any
 
 
 def _cache_key(provider: str, target_lang: str, text: str) -> str:
@@ -29,6 +30,7 @@ class TranslationCache:
         )
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute("PRAGMA synchronous=NORMAL")
+        self._conn.execute("PRAGMA busy_timeout=5000")
         self._conn.execute(
             """
             CREATE TABLE IF NOT EXISTS translations (
@@ -83,6 +85,67 @@ class TranslationCache:
                 (key, provider, target_lang, text, translated, now),
             )
             self._conn.commit()
+
+    def list_recent(self, limit: int = 50, query: str = "") -> list[dict[str, Any]]:
+        safe_limit = max(1, min(int(limit), 200))
+        q = query.strip()
+        with self._lock:
+            if q:
+                like = f"%{q}%"
+                rows = self._conn.execute(
+                    """
+                    SELECT cache_key, provider, target_lang, source_text, translated_text, updated_at
+                    FROM translations
+                    WHERE source_text LIKE ? OR translated_text LIKE ?
+                    ORDER BY updated_at DESC
+                    LIMIT ?
+                    """,
+                    (like, like, safe_limit),
+                ).fetchall()
+            else:
+                rows = self._conn.execute(
+                    """
+                    SELECT cache_key, provider, target_lang, source_text, translated_text, updated_at
+                    FROM translations
+                    ORDER BY updated_at DESC
+                    LIMIT ?
+                    """,
+                    (safe_limit,),
+                ).fetchall()
+        return [
+            {
+                "cache_key": r[0],
+                "provider": r[1],
+                "target_lang": r[2],
+                "source_text": r[3],
+                "translated_text": r[4],
+                "updated_at": float(r[5]),
+            }
+            for r in rows
+        ]
+
+    def delete_key(self, cache_key: str) -> bool:
+        with self._lock:
+            self._lru.pop(cache_key, None)
+            cur = self._conn.execute(
+                "DELETE FROM translations WHERE cache_key = ?",
+                (cache_key,),
+            )
+            self._conn.commit()
+            return cur.rowcount > 0
+
+    def clear(self, provider: str | None = None) -> int:
+        with self._lock:
+            self._lru.clear()
+            if provider:
+                cur = self._conn.execute(
+                    "DELETE FROM translations WHERE provider = ?",
+                    (provider,),
+                )
+            else:
+                cur = self._conn.execute("DELETE FROM translations")
+            self._conn.commit()
+            return cur.rowcount
 
     def count(self) -> int:
         with self._lock:

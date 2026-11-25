@@ -34,7 +34,7 @@ class StubProvider(BaseTranslateProvider):
 
 
 class TestServer(unittest.TestCase):
-    def _start(self, provider: BaseTranslateProvider):
+    def _start(self, provider_impl: BaseTranslateProvider, **cfg_overrides):
         d = tempfile.TemporaryDirectory()
         cfg = TranslationConfig(
             host="127.0.0.1",
@@ -42,9 +42,15 @@ class TestServer(unittest.TestCase):
             force_target_vi=True,
             target_lang="vi",
             cache_db=Path(d.name) / "c.db",
+            **cfg_overrides,
         )
         cache = TranslationCache(cfg.cache_db)
-        svc = SingleFlightTranslator(cache, provider, cfg)
+        svc = SingleFlightTranslator(
+            cache,
+            provider_impl,
+            cfg,
+            config_path=Path(d.name) / "config.json",
+        )
         srv = create_http_server(cfg, svc)
         t = threading.Thread(target=srv.serve_forever, daemon=True)
         t.start()
@@ -118,7 +124,7 @@ class TestServer(unittest.TestCase):
 
     def test_upstream_failure_returns_502_and_does_not_poison_cache(self):
         prov = StubProvider(fail=True)
-        d, cache, srv = self._start(prov)
+        d, cache, srv = self._start(prov, fallback_to_google=False)
         try:
             url = (
                 f"http://127.0.0.1:{srv.server_port}/translate?from=zh&to=vi&q="
@@ -126,7 +132,10 @@ class TestServer(unittest.TestCase):
             )
             with self.assertRaises(urllib.error.HTTPError) as ctx:
                 urllib.request.urlopen(url, timeout=5)
-            self.assertEqual(ctx.exception.code, 502)
+            try:
+                self.assertEqual(ctx.exception.code, 502)
+            finally:
+                ctx.exception.close()
             self.assertEqual(cache.count(), 0)
         finally:
             srv.shutdown()
@@ -134,16 +143,92 @@ class TestServer(unittest.TestCase):
             cache.close()
             d.cleanup()
 
-    def test_health_endpoint_reports_status_and_cached_count(self):
+    def test_ai_failure_falls_back_to_google_when_enabled(self):
+        prov = StubProvider(fail=True)
+        d, cache, srv = self._start(prov, provider="ai", fallback_to_google=True)
+        try:
+            srv.translator._fallback_provider = StubProvider(fail=False)  # type: ignore[attr-defined]
+            url = (
+                f"http://127.0.0.1:{srv.server_port}/translate?from=zh&to=vi&q="
+                + urllib.parse.quote("你好")
+            )
+            with urllib.request.urlopen(url, timeout=5) as r:
+                body = json.loads(r.read().decode("utf-8"))
+            self.assertEqual(body, [[["[vi] 你好"]]])
+            self.assertIsNone(cache.get("ai", "vi", "你好"))
+            self.assertEqual(cache.get("google_gtx:slang", "vi", "你好"), "[vi] 你好")
+        finally:
+            srv.shutdown()
+            srv.server_close()
+            cache.close()
+            d.cleanup()
+
+    def test_dashboard_and_management_apis(self):
         prov = StubProvider()
         d, cache, srv = self._start(prov)
+        base = f"http://127.0.0.1:{srv.server_port}"
         try:
-            url = f"http://127.0.0.1:{srv.server_port}/health"
-            with urllib.request.urlopen(url, timeout=5) as r:
+            with urllib.request.urlopen(f"{base}/health", timeout=5) as r:
                 health = json.loads(r.read().decode("utf-8"))
             self.assertTrue(health["ok"])
             self.assertEqual(health["target_lang"], "vi")
-            self.assertEqual(health["cached"], 0)
+
+            with urllib.request.urlopen(f"{base}/", timeout=5) as r:
+                html_body = r.read().decode("utf-8")
+            self.assertIn("Telegram PC", html_body)
+
+            req_test = urllib.request.Request(
+                f"{base}/api/test",
+                data=json.dumps({"text": "你好"}).encode("utf-8"),
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with urllib.request.urlopen(req_test, timeout=5) as r:
+                test_res = json.loads(r.read().decode("utf-8"))
+            self.assertEqual(test_res["translated"], "[vi] 你好")
+            self.assertEqual(cache.count(), 0)
+
+            with urllib.request.urlopen(f"{base}/translate?from=zh&to=vi&q=" + urllib.parse.quote("测试"), timeout=5) as r:
+                self.assertEqual(json.loads(r.read().decode("utf-8")), [[["[vi] 测试"]]])
+            self.assertEqual(cache.count(), 1)
+
+            req_cfg = urllib.request.Request(
+                f"{base}/api/config",
+                data=json.dumps({"slang_fixups": False}).encode("utf-8"),
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with urllib.request.urlopen(req_cfg, timeout=5) as r:
+                cfg_res = json.loads(r.read().decode("utf-8"))
+            self.assertTrue(cfg_res["ok"])
+            self.assertFalse(cfg_res["config"]["slang_fixups"])
+
+            req_clear = urllib.request.Request(
+                f"{base}/api/cache/clear",
+                data=json.dumps({"provider": ""}).encode("utf-8"),
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with urllib.request.urlopen(req_clear, timeout=5) as r:
+                clr = json.loads(r.read().decode("utf-8"))
+            self.assertEqual(clr["cached"], 0)
+
+            with urllib.request.urlopen(f"{base}/api/mtproto/status", timeout=5) as r:
+                mt_status = json.loads(r.read().decode("utf-8"))
+            self.assertIn("state", mt_status)
+            self.assertFalse(mt_status["config"]["mtproto_enabled"])
+
+            req_mt_cfg = urllib.request.Request(
+                f"{base}/api/mtproto/config",
+                data=json.dumps({"mtproto_api_id": 123456, "mtproto_prefetch_limit": 250}).encode("utf-8"),
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with urllib.request.urlopen(req_mt_cfg, timeout=5) as r:
+                mt_cfg_res = json.loads(r.read().decode("utf-8"))
+            self.assertTrue(mt_cfg_res["ok"])
+            self.assertEqual(mt_cfg_res["config"]["mtproto_api_id"], 123456)
+            self.assertEqual(mt_cfg_res["config"]["mtproto_prefetch_limit"], 250)
         finally:
             srv.shutdown()
             srv.server_close()

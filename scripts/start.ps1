@@ -16,7 +16,7 @@ $ShimLog = Join-Path $env:LOCALAPPDATA "TelegramViShim\shim.log"
 $HostAddr = "127.0.0.1"
 $Port = 18765
 if (Test-Path $CfgPath) {
-    $cfg = Get-Content $CfgPath -Raw -Encoding UTF8 | ConvertFrom-Json
+    $cfg = [IO.File]::ReadAllText($CfgPath, [Text.Encoding]::UTF8) | ConvertFrom-Json
     if ($cfg.host) { $HostAddr = $cfg.host }
     if ($cfg.port) { $Port = [int]$cfg.port }
 }
@@ -34,12 +34,30 @@ if (-not (Test-ProxyHealth)) {
     New-Item -ItemType Directory -Force -Path $LogDir | Out-Null
     $pyw = Get-Command pythonw -ErrorAction SilentlyContinue
     $pyExe = if ($pyw) { $pyw.Source } else { (Get-Command python).Source }
-    $proc = Start-Process -FilePath $pyExe `
-        -ArgumentList "-m", "translator_proxy", "--log-file", $ProxyLog `
-        -WorkingDirectory $RepoRoot `
-        -WindowStyle Hidden `
-        -PassThru
-    $proc.Id | Set-Content -Path $PidFile -Encoding ASCII
+    $launchedPid = $null
+    try {
+        $startup = New-CimInstance -ClassName Win32_ProcessStartup -ClientOnly -Property @{ ShowWindow = [uint16]0 }
+        $cmdLine = "`"$pyExe`" -m translator_proxy --log-file `"$ProxyLog`""
+        $res = Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{
+            CommandLine = $cmdLine
+            CurrentDirectory = $RepoRoot
+            ProcessStartupInformation = $startup
+        }
+        if ($res.ReturnValue -eq 0 -and $res.ProcessId) {
+            $launchedPid = [int]$res.ProcessId
+        }
+    } catch {
+        $launchedPid = $null
+    }
+    if (-not $launchedPid) {
+        $proc = Start-Process -FilePath $pyExe `
+            -ArgumentList "-m", "translator_proxy", "--log-file", $ProxyLog `
+            -WorkingDirectory $RepoRoot `
+            -WindowStyle Hidden `
+            -PassThru
+        $launchedPid = $proc.Id
+    }
+    $launchedPid | Set-Content -Path $PidFile -Encoding ASCII
 
     $ready = $false
     for ($i = 0; $i -lt 25; $i++) {
@@ -49,39 +67,29 @@ if (-not (Test-ProxyHealth)) {
     if (-not $ready) {
         throw "translator_proxy khong phan hoi tai http://${HostAddr}:${Port}/health (xem $ProxyLog)"
     }
-    Write-Host "[start] Proxy dang chay (PID=$($proc.Id)) tai http://${HostAddr}:${Port}"
+    Write-Host "[start] Proxy dang chay (PID=$launchedPid) tai http://${HostAddr}:${Port}"
 } else {
-    Write-Host "[start] Proxy da san sang tai http://${HostAddr}:${Port}"
+    Write-Host "[start] Proxy da san sang tai http://${HostAddr}:${Port} (Dashboard: http://${HostAddr}:${Port}/)"
 }
 
 if (-not (Test-Path $LauncherExe)) {
     throw "Chua tim thay $LauncherExe. Hay chay .\scripts\install.ps1 truoc."
 }
-
-$runningTg = Get-Process -Name Telegram -ErrorAction SilentlyContinue
-if ($runningTg -and $RestartTelegram) {
-    Write-Host "[start] Dang dung Telegram Desktop de khoi chay lai voi patch..."
-    $runningTg | Stop-Process -Force
-    $runningTg | Wait-Process -Timeout 10 -ErrorAction SilentlyContinue
-    Start-Sleep -Milliseconds 400
-    $runningTg = $null
+if (-not (Test-Path $TgExe)) {
+    throw "Khong tim thay $TgExe"
 }
 
-if (-not $runningTg) {
-    if (-not (Test-Path $TgExe)) { throw "Khong tim thay $TgExe" }
-    & $LauncherExe --telegram $TgExe --log-file $ShimLog
+$rawCheck = (& $LauncherExe --check --telegram $TgExe --no-proxy | Out-String).Trim()
+$checkJson = $rawCheck | ConvertFrom-Json
+if ($checkJson.running -and $RestartTelegram) {
+    Write-Host "[start] Dang khoi dong lai Telegram Desktop voi patch..."
+    & $LauncherExe --telegram $TgExe --log-file $ShimLog --repo-root $RepoRoot --restart
     if ($LASTEXITCODE -ne 0) { throw "vi_launcher.exe khoi chay Telegram that bai" }
-    Start-Sleep -Seconds 2
-    $launched = Get-Process -Name Telegram -ErrorAction SilentlyContinue | Select-Object -First 1
-    if ($launched -and $launched.MainWindowHandle -eq 0) {
-        Start-Process -FilePath $TgExe -ArgumentList "-noupdate" -WorkingDirectory $TgDir
-    }
+} elseif (-not $checkJson.running) {
+    & $LauncherExe --telegram $TgExe --log-file $ShimLog --repo-root $RepoRoot
+    if ($LASTEXITCODE -ne 0) { throw "vi_launcher.exe khoi chay Telegram that bai" }
+} elseif ($checkJson.patched) {
+    Write-Host "[start] Telegram Desktop (PID=$($checkJson.pids -join ',')) da duoc mo khoa dich."
 } else {
-    $tgPid = ($runningTg | Select-Object -First 1).Id
-    $patched = (Test-Path $ShimLog) -and [bool](Select-String -Path $ShimLog -Pattern "patched pid=$tgPid\b" -Quiet)
-    if ($patched) {
-        Write-Host "[start] Telegram Desktop (PID=$tgPid) da duoc mo khoa dich."
-    } else {
-        Write-Host "[start] Telegram Desktop (PID=$tgPid) dang chay ban chua patch. Hay chay lai voi -RestartTelegram."
-    }
+    Write-Host "[start] Telegram Desktop (PID=$($checkJson.pids -join ',')) dang chay ban chua patch. Hay chay lai voi -RestartTelegram."
 }

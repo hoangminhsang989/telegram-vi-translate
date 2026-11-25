@@ -1,10 +1,11 @@
+import os
 import tempfile
 import threading
 import unittest
 from pathlib import Path
 
 from translator_proxy.cache import TranslationCache
-from translator_proxy.config import TranslationConfig, load_config
+from translator_proxy.config import TranslationConfig, load_config, save_config_updates
 
 
 class TestConfigAndCache(unittest.TestCase):
@@ -16,7 +17,33 @@ class TestConfigAndCache(unittest.TestCase):
             self.assertEqual(cfg.port, 19000)
             self.assertFalse(cfg.force_target_vi)
             self.assertEqual(cfg.provider, "google_gtx")
+            self.assertTrue(cfg.slang_fixups)
+            self.assertTrue(cfg.fallback_to_google)
             self.assertIsInstance(cfg, TranslationConfig)
+
+    def test_save_config_updates_and_env_override(self):
+        with tempfile.TemporaryDirectory() as d:
+            cfg_path = Path(d) / "config.json"
+            saved = save_config_updates(
+                {"provider": "ai", "ai_base_url": "https://api.example.com/v1", "ai_api_key": "sk-secret-1234"},
+                cfg_path,
+            )
+            self.assertEqual(saved.provider, "ai")
+            self.assertEqual(saved.ai_api_key, "sk-secret-1234")
+            pub = saved.to_public_dict(mask_secret=True)
+            self.assertNotIn("ai_api_key", pub)
+            self.assertTrue(pub["has_ai_api_key"])
+
+            old_env = os.environ.get("VI_TRANSLATE_AI_MODEL")
+            os.environ["VI_TRANSLATE_AI_MODEL"] = "gemini-2.5-flash"
+            try:
+                reloaded = load_config(cfg_path)
+                self.assertEqual(reloaded.ai_model, "gemini-2.5-flash")
+            finally:
+                if old_env is None:
+                    os.environ.pop("VI_TRANSLATE_AI_MODEL", None)
+                else:
+                    os.environ["VI_TRANSLATE_AI_MODEL"] = old_env
 
     def test_cache_persists_across_reopen_and_namespaces_by_provider(self):
         with tempfile.TemporaryDirectory() as d:
@@ -33,6 +60,13 @@ class TestConfigAndCache(unittest.TestCase):
             self.assertEqual(c2.get("google_gtx", "vi", "你好"), "Xin chào")
             self.assertEqual(c2.get("ai", "vi", "你好"), "Chào bạn")
             self.assertIsNone(c2.get("google_gtx", "en", "你好"))
+            items = c2.list_recent(limit=10, query="0元购")
+            self.assertEqual(len(items), 1)
+            self.assertTrue(c2.delete_key(items[0]["cache_key"]))
+            self.assertEqual(c2.count(), 3)
+            removed = c2.clear("google_gtx")
+            self.assertEqual(removed, 2)
+            self.assertEqual(c2.count(), 1)
             c2.close()
 
     def test_cache_concurrent_writes_do_not_lock(self):

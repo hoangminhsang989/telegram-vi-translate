@@ -23,6 +23,23 @@ if (Test-Path $OldShimDll) {
     Remove-Item $OldShimDll -Force -ErrorAction SilentlyContinue
 }
 
+$shortcuts = @(
+    (Join-Path ([Environment]::GetFolderPath("Desktop")) "Telegram (VI).lnk"),
+    (Join-Path $env:APPDATA "Microsoft\Windows\Start Menu\Programs\Telegram Desktop\Telegram (VI).lnk")
+)
+foreach ($sc in $shortcuts) {
+    if (Test-Path $sc) {
+        Remove-Item $sc -Force -ErrorAction SilentlyContinue
+        Write-Host "[uninstall] Da xoa shortcut: $sc"
+    }
+}
+
+$runKey = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Run"
+if (Get-ItemProperty -Path $runKey -Name "TelegramViTranslate" -ErrorAction SilentlyContinue) {
+    Remove-ItemProperty -Path $runKey -Name "TelegramViTranslate" -ErrorAction SilentlyContinue
+    Write-Host "[uninstall] Da tat tu dong khoi dong TelegramViTranslate"
+}
+
 Push-Location $RepoRoot
 try {
     python -m scripts.config_telegram --uninstall --tdata $TdataDir

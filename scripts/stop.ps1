@@ -1,6 +1,7 @@
 $ErrorActionPreference = "Stop"
 $RepoRoot = Split-Path -Parent $PSScriptRoot
 $PidFile = Join-Path $RepoRoot "logs\proxy.pid"
+$stoppedAny = $false
 
 if (Test-Path $PidFile) {
     $pidText = (Get-Content $PidFile -Raw).Trim()
@@ -10,11 +11,20 @@ if (Test-Path $PidFile) {
         if ($cim -and $cim.CommandLine -match 'translator_proxy') {
             Stop-Process -Id $targetPid -Force -ErrorAction SilentlyContinue
             Write-Host "[stop] Da dung translator_proxy (PID=$targetPid)."
-        } else {
-            Write-Host "[stop] PID=$targetPid khong con la translator_proxy."
+            $stoppedAny = $true
         }
     }
     Remove-Item $PidFile -Force -ErrorAction SilentlyContinue
-} else {
-    Write-Host "[stop] Khong tim thay logs/proxy.pid."
+}
+
+$extraProcs = Get-CimInstance Win32_Process -Filter "Name='python.exe' OR Name='pythonw.exe'" -ErrorAction SilentlyContinue |
+    Where-Object { $_.CommandLine -match 'translator_proxy' }
+foreach ($p in $extraProcs) {
+    Stop-Process -Id $p.ProcessId -Force -ErrorAction SilentlyContinue
+    Write-Host "[stop] Da dung translator_proxy (PID=$($p.ProcessId))."
+    $stoppedAny = $true
+}
+
+if (-not $stoppedAny) {
+    Write-Host "[stop] translator_proxy khong chay."
 }

@@ -1,6 +1,6 @@
 use core::ffi::c_void;
 use std::fs::OpenOptions;
-use std::io::Write;
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::Path;
 
 use crate::pe_patch::{PatchPlan, build_rpl_single_true_stub, find_translate_tracker_patch};
@@ -10,6 +10,14 @@ const MEM_COMMIT: u32 = 0x1000;
 const MEM_RESERVE: u32 = 0x2000;
 const PAGE_EXECUTE_READ: u32 = 0x20;
 const PAGE_EXECUTE_READWRITE: u32 = 0x40;
+const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
+const PROCESS_VM_READ: u32 = 0x0010;
+const PROCESS_TERMINATE: u32 = 0x0001;
+const SYNCHRONIZE: u32 = 0x0010_0000;
+const TH32CS_SNAPPROCESS: u32 = 0x0000_0002;
+const INVALID_HANDLE_VALUE: isize = -1;
+const MAX_LOG_BYTES: u64 = 256 * 1024;
+const KEEP_LOG_BYTES: u64 = 64 * 1024;
 
 #[repr(C)]
 struct ProcessBasicInformation {
@@ -51,6 +59,32 @@ struct ProcessInformation {
     dw_thread_id: u32,
 }
 
+#[repr(C)]
+pub struct ProcessEntry32W {
+    dw_size: u32,
+    cnt_usage: u32,
+    th32_process_id: u32,
+    th32_default_heap_id: usize,
+    th32_module_id: u32,
+    cnt_threads: u32,
+    th32_parent_process_id: u32,
+    pc_pri_class_base: i32,
+    dw_flags: u32,
+    sz_exe_file: [u16; 260],
+}
+
+#[repr(C)]
+struct SystemTime {
+    year: u16,
+    month: u16,
+    day_of_week: u16,
+    day: u16,
+    hour: u16,
+    minute: u16,
+    second: u16,
+    milliseconds: u16,
+}
+
 #[link(name = "ntdll")]
 unsafe extern "system" {
     fn NtQueryInformationProcess(
@@ -76,6 +110,13 @@ unsafe extern "system" {
         lpStartupInfo: *const StartupInfoW,
         lpProcessInformation: *mut ProcessInformation,
     ) -> i32;
+    fn OpenProcess(dwDesiredAccess: u32, bInheritHandle: i32, dwProcessId: u32) -> *mut c_void;
+    fn TerminateProcess(hProcess: *mut c_void, uExitCode: u32) -> i32;
+    fn WaitForSingleObject(hHandle: *mut c_void, dwMilliseconds: u32) -> u32;
+    fn CreateToolhelp32Snapshot(dwFlags: u32, th32ProcessID: u32) -> *mut c_void;
+    fn Process32FirstW(hSnapshot: *mut c_void, lppe: *mut ProcessEntry32W) -> i32;
+    fn Process32NextW(hSnapshot: *mut c_void, lppe: *mut ProcessEntry32W) -> i32;
+    fn GetLocalTime(lpSystemTime: *mut SystemTime);
     fn ReadProcessMemory(
         hProcess: *mut c_void,
         lpBaseAddress: *const c_void,
@@ -114,18 +155,100 @@ unsafe extern "system" {
     fn GetLastError() -> u32;
 }
 
-fn to_wide_z(s: &str) -> Vec<u16> {
+pub fn to_wide_z(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(core::iter::once(0)).collect()
 }
 
-fn write_log(log_path: Option<&Path>, line: &str) {
+fn timestamp_prefix() -> String {
+    let mut st = SystemTime {
+        year: 0,
+        month: 0,
+        day_of_week: 0,
+        day: 0,
+        hour: 0,
+        minute: 0,
+        second: 0,
+        milliseconds: 0,
+    };
+    unsafe { GetLocalTime(&mut st) };
+    format!(
+        "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
+        st.year, st.month, st.day, st.hour, st.minute, st.second
+    )
+}
+
+pub fn write_log(log_path: Option<&Path>, line: &str) {
     let Some(path) = log_path else { return };
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-    if let Ok(mut f) = OpenOptions::new().create(true).append(true).open(path) {
-        let _ = writeln!(f, "{line}");
+    if let Ok(meta) = std::fs::metadata(path)
+        && meta.len() > MAX_LOG_BYTES
+        && let Ok(mut f) = OpenOptions::new().read(true).open(path)
+    {
+        let start = meta.len().saturating_sub(KEEP_LOG_BYTES);
+        if f.seek(SeekFrom::Start(start)).is_ok() {
+            let mut tail = Vec::new();
+            if f.read_to_end(&mut tail).is_ok() {
+                let aligned = tail
+                    .iter()
+                    .position(|&b| b == b'\n')
+                    .map_or(0, |p| p + 1);
+                let _ = std::fs::write(path, &tail[aligned..]);
+            }
+        }
     }
+    if let Ok(mut f) = OpenOptions::new().create(true).append(true).open(path) {
+        let _ = writeln!(f, "{} {}", timestamp_prefix(), line);
+    }
+}
+
+/// Enumerate process IDs matching `exe_name` (case-insensitive, e.g. `Telegram.exe`).
+pub fn list_processes_by_name(exe_name: &str) -> Vec<u32> {
+    let snap = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
+    if snap.is_null() || snap as isize == INVALID_HANDLE_VALUE {
+        return Vec::new();
+    }
+    let mut entry: ProcessEntry32W = unsafe { core::mem::zeroed() };
+    entry.dw_size = size_of::<ProcessEntry32W>() as u32;
+
+    let mut pids = Vec::new();
+    let mut ok = unsafe { Process32FirstW(snap, &mut entry) };
+    while ok != 0 {
+        let end = entry
+            .sz_exe_file
+            .iter()
+            .position(|&c| c == 0)
+            .unwrap_or(entry.sz_exe_file.len());
+        let name = String::from_utf16_lossy(&entry.sz_exe_file[..end]);
+        if name.eq_ignore_ascii_case(exe_name) {
+            pids.push(entry.th32_process_id);
+        }
+        entry.dw_size = size_of::<ProcessEntry32W>() as u32;
+        ok = unsafe { Process32NextW(snap, &mut entry) };
+    }
+    unsafe { CloseHandle(snap) };
+    pids
+}
+
+/// Terminate a running process by PID and wait briefly for exit.
+pub fn terminate_process_by_pid(pid: u32) -> Result<(), String> {
+    let h_proc = unsafe { OpenProcess(PROCESS_TERMINATE | SYNCHRONIZE, 0, pid) };
+    if h_proc.is_null() {
+        return Err(format!("OpenProcess(TERMINATE, pid={pid}) failed: err={}", unsafe {
+            GetLastError()
+        }));
+    }
+    let ok = unsafe { TerminateProcess(h_proc, 0) };
+    if ok != 0 {
+        unsafe { WaitForSingleObject(h_proc, 5000) };
+    }
+    let err = unsafe { GetLastError() };
+    unsafe { CloseHandle(h_proc) };
+    if ok == 0 {
+        return Err(format!("TerminateProcess(pid={pid}) failed: err={err}"));
+    }
+    Ok(())
 }
 
 /// Read the remote process's `PEB.ImageBaseAddress` (offset `0x10` on x64).
@@ -170,6 +293,54 @@ pub unsafe fn read_process_image_base(h_process: *mut c_void) -> Result<u64, Str
         ));
     }
     Ok(image_base)
+}
+
+/// Inspect a live process's memory at `call_site_rva` to check whether the stub patch is active.
+pub unsafe fn is_process_call_site_patched(
+    h_process: *mut c_void,
+    image_base: u64,
+    plan: &PatchPlan,
+) -> Result<bool, String> {
+    let call_site_va = image_base + plan.call_site_rva as u64;
+    let mut buf = [0u8; 5];
+    let mut read = 0usize;
+    let ok = unsafe {
+        ReadProcessMemory(
+            h_process,
+            call_site_va as *const c_void,
+            buf.as_mut_ptr().cast(),
+            buf.len(),
+            &mut read,
+        )
+    };
+    if ok == 0 || read != buf.len() {
+        return Err(format!(
+            "ReadProcessMemory(call_site) failed: err={}",
+            unsafe { GetLastError() }
+        ));
+    }
+    if buf[0] != 0xE8 {
+        return Err(format!("unexpected opcode {:#x} at call_site", buf[0]));
+    }
+    let rel32 = i32::from_le_bytes(buf[1..5].try_into().unwrap()) as i64;
+    let target_rva = (plan.call_site_rva as i64) + 5 + rel32;
+    Ok(target_rva != plan.am_premium_rva as i64)
+}
+
+/// Check live memory of a running PID against `PatchPlan`.
+pub fn verify_pid_patched(pid: u32, plan: &PatchPlan) -> Result<bool, String> {
+    let h_proc = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_VM_READ, 0, pid) };
+    if h_proc.is_null() {
+        return Err(format!("OpenProcess(pid={pid}) failed: err={}", unsafe {
+            GetLastError()
+        }));
+    }
+    let res = unsafe {
+        read_process_image_base(h_proc)
+            .and_then(|base| is_process_call_site_patched(h_proc, base, plan))
+    };
+    unsafe { CloseHandle(h_proc) };
+    res
 }
 
 unsafe fn alloc_near_remote(h_process: *mut c_void, target_va: u64, size: usize) -> *mut c_void {
@@ -270,7 +441,7 @@ pub unsafe fn patch_remote_call_site(
         VirtualProtectEx(h_process, stub_ptr, 4096, PAGE_EXECUTE_READ, &mut old_stub_prot);
     }
 
-    let rel = (stub_va as i64) - (call_site_va as i64 + 5);
+    let rel = (stub_va as isize as i64) - (call_site_va as i64 + 5);
     let rel32 = i32::try_from(rel).map_err(|_| "allocated stub out of i32 call range".to_owned())?;
     let mut patch = [0u8; 5];
     patch[0] = 0xE8;
@@ -342,8 +513,6 @@ pub fn launch_and_patch_telegram(
     si.cb = size_of::<StartupInfoW>() as u32;
     si.dw_flags = 1; // STARTF_USESHOWWINDOW
     si.w_show_window = 1; // SW_SHOWNORMAL
-    let mut desktop_w = to_wide_z(r"Winsta0\Default");
-    si.lp_desktop = desktop_w.as_mut_ptr();
     let mut pi: ProcessInformation = unsafe { core::mem::zeroed() };
 
     let ok = unsafe {
