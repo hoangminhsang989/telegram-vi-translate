@@ -1,0 +1,8 @@
+[package]
+name = "shim_mscms"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "mscms"
+crate-type = ["cdylib", "rlib"]
