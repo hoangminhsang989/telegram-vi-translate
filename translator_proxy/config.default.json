@@ -1,0 +1,20 @@
+{
+  "host": "127.0.0.1",
+  "port": 18765,
+  "provider": "google_gtx",
+  "force_target_vi": true,
+  "target_lang": "vi",
+  "cache_db": "data/cache.db",
+  "max_memory_items": 4096,
+  "timeout_sec": 8.0,
+  "ai_base_url": "",
+  "ai_api_key": "",
+  "ai_model": "gpt-4o-mini",
+  "glossary": {
+    "0元购": "săn deal 0 đồng",
+    "薅羊毛": "săn kèo hời",
+    "羊毛": "kèo hời / ưu đãi",
+    "脚本": "script",
+    "上车": "tham gia / chốt kèo"
+  }
+}
