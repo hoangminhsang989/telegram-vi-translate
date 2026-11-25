@@ -1,0 +1,7 @@
+.superpowers/
+__pycache__/
+*.pyc
+data/
+logs/
+translator_proxy/config.json
+shim_mscms/target/
